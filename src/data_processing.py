@@ -1,4 +1,4 @@
-"""Feature engineering pipeline for credit risk modeling."""
+"""Feature engineering and target construction for credit risk modeling."""
 
 from __future__ import annotations
 
@@ -8,10 +8,12 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 
+TARGET_COLUMN = "is_high_risk"
 CUSTOMER_ID_COLUMN = "CustomerId"
 DATETIME_COLUMN = "TransactionStartTime"
 CATEGORICAL_COLUMNS = ["ProductCategory", "ChannelId", "CurrencyCode"]
@@ -27,6 +29,7 @@ DATETIME_FEATURE_COLUMNS = [
     "transaction_month",
     "transaction_year",
 ]
+RFM_COLUMNS = ["recency", "frequency", "monetary"]
 DEFAULT_RANDOM_STATE = 42
 
 
@@ -79,10 +82,83 @@ class CustomerAggregator(BaseEstimator, TransformerMixin):
         return agg.reset_index()
 
 
+class RFMTargetEngineer(BaseEstimator, TransformerMixin):
+    """Compute RFM metrics, cluster customers, and assign a proxy high-risk label."""
+
+    def __init__(
+        self,
+        n_clusters: int = 3,
+        random_state: int = DEFAULT_RANDOM_STATE,
+        snapshot_date: Optional[pd.Timestamp] = None,
+    ):
+        self.n_clusters = n_clusters
+        self.random_state = random_state
+        self.snapshot_date = snapshot_date
+        self.high_risk_cluster_: Optional[int] = None
+        self.kmeans_: Optional[KMeans] = None
+        self.snapshot_date_: Optional[pd.Timestamp] = None
+
+    def fit(self, X, y=None):
+        df = _ensure_dataframe(X)
+        rfm = self._compute_rfm(df)
+        scaled = StandardScaler().fit_transform(rfm[RFM_COLUMNS])
+
+        n_clusters = min(self.n_clusters, len(rfm))
+        self.kmeans_ = KMeans(n_clusters=n_clusters, random_state=self.random_state, n_init=10)
+        self.kmeans_.fit(scaled)
+
+        centers = pd.DataFrame(self.kmeans_.cluster_centers_, columns=RFM_COLUMNS)
+        centers["risk_score"] = (
+            centers["recency"] - centers["frequency"] - centers["monetary"]
+        )
+        self.high_risk_cluster_ = int(centers["risk_score"].idxmax())
+        return self
+
+    def transform(self, X):
+        if self.kmeans_ is None or self.high_risk_cluster_ is None:
+            raise RuntimeError("RFMTargetEngineer must be fitted before transform.")
+
+        df = _ensure_dataframe(X)
+        rfm = self._compute_rfm(df)
+        scaled = StandardScaler().fit_transform(rfm[RFM_COLUMNS])
+        clusters = self.kmeans_.predict(scaled)
+
+        out = df.copy()
+        out["recency"] = rfm["recency"].values
+        out["frequency"] = rfm["frequency"].values
+        out["monetary"] = rfm["monetary"].values
+        out["rfm_cluster"] = clusters
+        out[TARGET_COLUMN] = (clusters == self.high_risk_cluster_).astype(int)
+        return out
+
+    def _compute_rfm(self, df: pd.DataFrame) -> pd.DataFrame:
+        working = df.copy()
+        if self.snapshot_date_ is None:
+            self.snapshot_date_ = pd.to_datetime(
+                self.snapshot_date or working["last_transaction_time"].max(),
+                utc=True,
+            )
+
+        recency = (
+            self.snapshot_date_ - pd.to_datetime(working["last_transaction_time"], utc=True)
+        ).dt.days
+        frequency = working["transaction_count"]
+        monetary = working["total_amount"]
+
+        return pd.DataFrame(
+            {
+                "recency": recency,
+                "frequency": frequency,
+                "monetary": monetary,
+            },
+            index=working.index,
+        )
+
+
 class WoEEncoder(BaseEstimator, TransformerMixin):
     """Weight of Evidence encoder for categorical columns against a binary target."""
 
-    def __init__(self, categorical_columns: Iterable[str], target_column: str):
+    def __init__(self, categorical_columns: Iterable[str], target_column: str = TARGET_COLUMN):
         self.categorical_columns = list(categorical_columns)
         self.target_column = target_column
         self.woe_maps_: dict[str, dict[str, float]] = {}
@@ -129,18 +205,16 @@ class WoEEncoder(BaseEstimator, TransformerMixin):
 
 
 class FeaturePreprocessor(BaseEstimator, TransformerMixin):
-    """Impute, encode, scale, and optionally apply WoE on customer-level data."""
+    """Impute, encode, scale, and apply WoE on customer-level data."""
 
     def __init__(
         self,
         scale_method: str = "standard",
-        use_woe: bool = False,
-        target_column: Optional[str] = None,
+        use_woe: bool = True,
     ):
         self.scale_method = scale_method
         self.use_woe = use_woe
-        self.target_column = target_column
-        self.woe_encoder_: Optional[WoEEncoder] = None
+        self.woe_encoder_ = WoEEncoder(CATEGORICAL_COLUMNS)
         self.one_hot_encoder_ = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
         self.preprocessor_: Optional[Pipeline] = None
         self.feature_columns_: list[str] = []
@@ -148,13 +222,10 @@ class FeaturePreprocessor(BaseEstimator, TransformerMixin):
 
     def fit(self, X, y=None):
         df = _ensure_dataframe(X)
-        working = df.copy()
+        if self.use_woe:
+            self.woe_encoder_.fit(df)
 
-        if self.use_woe and self.target_column:
-            self.woe_encoder_ = WoEEncoder(CATEGORICAL_COLUMNS, self.target_column)
-            self.woe_encoder_.fit(working)
-            working = self.woe_encoder_.transform(working)
-
+        working = self.woe_encoder_.transform(df) if self.use_woe else df.copy()
         cat_present = [col for col in CATEGORICAL_COLUMNS if col in working.columns]
         if cat_present:
             self.one_hot_encoder_.fit(working[cat_present])
@@ -165,11 +236,8 @@ class FeaturePreprocessor(BaseEstimator, TransformerMixin):
         numeric_cols = (
             AGGREGATE_NUMERIC_COLUMNS
             + DATETIME_FEATURE_COLUMNS
-            + [
-                f"{col}_woe"
-                for col in CATEGORICAL_COLUMNS
-                if f"{col}_woe" in working.columns
-            ]
+            + RFM_COLUMNS
+            + [f"{col}_woe" for col in CATEGORICAL_COLUMNS if f"{col}_woe" in working.columns]
         )
         numeric_cols = [col for col in numeric_cols if col in working.columns]
 
@@ -198,10 +266,7 @@ class FeaturePreprocessor(BaseEstimator, TransformerMixin):
             raise RuntimeError("FeaturePreprocessor must be fitted before transform.")
 
         df = _ensure_dataframe(X)
-        working = df.copy()
-        if self.use_woe and self.woe_encoder_ is not None:
-            working = self.woe_encoder_.transform(working)
-
+        working = self.woe_encoder_.transform(df) if self.use_woe else df.copy()
         cat_present = [col for col in CATEGORICAL_COLUMNS if col in working.columns]
         if cat_present and self.one_hot_columns_:
             encoded = self.one_hot_encoder_.transform(working[cat_present])
@@ -215,7 +280,7 @@ class FeaturePreprocessor(BaseEstimator, TransformerMixin):
 
         return pd.concat(
             [
-                working[[CUSTOMER_ID_COLUMN]].reset_index(drop=True),
+                working[[CUSTOMER_ID_COLUMN, TARGET_COLUMN]].reset_index(drop=True),
                 scaled_df.reset_index(drop=True),
             ],
             axis=1,
@@ -225,13 +290,20 @@ class FeaturePreprocessor(BaseEstimator, TransformerMixin):
 class CreditDataProcessor(BaseEstimator, TransformerMixin):
     """End-to-end processor from raw transactions to model-ready customer data."""
 
-    def __init__(self, scale_method: str = "standard", use_woe: bool = False):
+    def __init__(
+        self,
+        scale_method: str = "standard",
+        use_woe: bool = True,
+        random_state: int = DEFAULT_RANDOM_STATE,
+    ):
         self.scale_method = scale_method
         self.use_woe = use_woe
+        self.random_state = random_state
         self.pipeline_ = Pipeline(
             [
                 ("datetime", DateTimeFeatureExtractor()),
                 ("aggregate", CustomerAggregator()),
+                ("rfm_target", RFMTargetEngineer(random_state=random_state)),
                 (
                     "preprocess",
                     FeaturePreprocessor(scale_method=scale_method, use_woe=use_woe),
@@ -256,19 +328,30 @@ class CreditDataProcessor(BaseEstimator, TransformerMixin):
 
 def build_processing_pipeline(
     scale_method: str = "standard",
-    use_woe: bool = False,
+    use_woe: bool = True,
+    random_state: int = DEFAULT_RANDOM_STATE,
 ) -> Pipeline:
-    """Return the sklearn Pipeline for credit data processing."""
-    return CreditDataProcessor(scale_method=scale_method, use_woe=use_woe).pipeline
+    """Return the fitted-ready sklearn Pipeline for credit data processing."""
+    processor = CreditDataProcessor(
+        scale_method=scale_method,
+        use_woe=use_woe,
+        random_state=random_state,
+    )
+    return processor.pipeline
 
 
 def process_raw_data(
     raw_df: pd.DataFrame,
     scale_method: str = "standard",
-    use_woe: bool = False,
+    use_woe: bool = True,
+    random_state: int = DEFAULT_RANDOM_STATE,
 ) -> pd.DataFrame:
     """Transform raw transaction data into a model-ready customer-level DataFrame."""
-    processor = CreditDataProcessor(scale_method=scale_method, use_woe=use_woe)
+    processor = CreditDataProcessor(
+        scale_method=scale_method,
+        use_woe=use_woe,
+        random_state=random_state,
+    )
     return processor.fit_transform(raw_df)
 
 
@@ -287,3 +370,15 @@ def load_and_process(
         processed.to_csv(path, index=False)
 
     return processed
+
+
+def get_feature_matrix(processed_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """Split processed data into features (X) and target (y)."""
+    feature_cols = [
+        col
+        for col in processed_df.columns
+        if col not in {CUSTOMER_ID_COLUMN, TARGET_COLUMN}
+    ]
+    X = processed_df[feature_cols]
+    y = processed_df[TARGET_COLUMN]
+    return X, y
