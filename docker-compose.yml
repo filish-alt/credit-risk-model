@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_TRACKING_URI: file:/app/mlruns
+      MLFLOW_MODEL_URI: ${MLFLOW_MODEL_URI:-models:/credit_risk_best_model/latest}
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./data:/app/data
